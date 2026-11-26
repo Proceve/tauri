@@ -71,7 +71,7 @@ Final diff:
              Ok(request) => {
                ...
 @@ -433,6 +447,7 @@ fn handle_ipc_message<R: Runtime>(request: Request<String>, manager: &AppManager
- 
+
  fn parse_invoke_request<R: Runtime>(
    #[allow(unused_variables)] manager: &AppManager<R>,
 +  fallback_origin: &Url,
