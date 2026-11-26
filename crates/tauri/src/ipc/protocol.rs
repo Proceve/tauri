@@ -59,7 +59,21 @@ pub fn get<R: Runtime>(manager: Arc<AppManager<R>>) -> UriSchemeProtocolHandler 
     match *request.method() {
       Method::POST => {
         if let Some(webview) = manager.get_webview(label) {
-          match parse_invoke_request(&manager, request) {
+          let fallback_origin = match webview.url() {
+            Ok(url) => url,
+            Err(e) => {
+              respond(
+                http::Response::builder()
+                  .status(StatusCode::INTERNAL_SERVER_ERROR)
+                  .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
+                  .body(e.to_string().into_bytes().into())
+                  .unwrap(),
+              );
+              return;
+            }
+          };
+
+          match parse_invoke_request(&manager, &fallback_origin, request) {
             Ok(request) => {
               #[cfg(feature = "tracing")]
               span.record(
@@ -433,6 +447,7 @@ fn handle_ipc_message<R: Runtime>(request: Request<String>, manager: &AppManager
 
 fn parse_invoke_request<R: Runtime>(
   #[allow(unused_variables)] manager: &AppManager<R>,
+  fallback_origin: &Url,
   request: http::Request<Vec<u8>>,
 ) -> std::result::Result<InvokeRequest, String> {
   #[allow(unused_mut)]
@@ -483,15 +498,25 @@ fn parse_invoke_request<R: Runtime>(
     .map_err(|_| "Tauri invoke key header value must be a string")?
     .to_owned();
 
-  let url = Url::parse(
-    parts
-      .headers
-      .get("Origin")
-      .ok_or("missing Origin header")?
-      .to_str()
-      .map_err(|_| "Origin header value must be a string")?,
-  )
-  .map_err(|_| "Origin header is not a valid URL")?;
+  // WebKitGTK sends a missing, empty, or opaque (`"null"`) `Origin` header for requests made
+  // from a custom URI scheme (see tauri-apps/wry#366), which otherwise hard-fails the IPC call.
+  // Fall back to the current URL of the webview this request is already bound to — it comes from
+  // the platform webview dispatcher, not from page-controlled input, so it can't be spoofed by
+  // page JS. A well-formed but mismatched Origin is NOT covered by this fallback and is still
+  // rejected below, preserving cross-origin IPC rejection.
+  let url = match parts.headers.get("Origin") {
+    Some(value) => {
+      let origin = value
+        .to_str()
+        .map_err(|_| "Origin header value must be a string")?;
+      if origin.is_empty() || origin == "null" {
+        fallback_origin.clone()
+      } else {
+        Url::parse(origin).map_err(|_| "Origin header is not a valid URL")?
+      }
+    }
+    None => fallback_origin.clone(),
+  };
 
   let callback = CallbackFn(
     parts
@@ -584,6 +609,7 @@ mod tests {
 
     let cmd = "write_something";
     let url = "tauri://localhost";
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
     let invoke_key = "1234ahdsjkl123";
     let callback = 12378123;
     let error = 6243;
@@ -612,7 +638,8 @@ mod tests {
 
     let body = vec![123, 31, 45];
     let request = request.body(body.clone()).unwrap();
-    let invoke_request = super::parse_invoke_request(&manager, request).unwrap();
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
 
     assert_eq!(invoke_request.cmd, cmd);
     assert_eq!(invoke_request.callback.0, callback);
@@ -636,10 +663,157 @@ mod tests {
     *request.headers_mut().unwrap() = headers.clone();
 
     let request = request.body(serde_json::to_vec(&body).unwrap()).unwrap();
-    let invoke_request = super::parse_invoke_request(&manager, request).unwrap();
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
 
     assert_eq!(invoke_request.headers, headers);
     assert_eq!(invoke_request.body, InvokeBody::Json(body));
+  }
+
+  /// Builds the fixed set of headers `parse_invoke_request` requires besides `Origin`
+  /// (invoke key, callback, error, content type), so each Origin-fallback test only has to
+  /// specify what it cares about: the `Origin` header itself.
+  fn base_headers(invoke_key: &str, callback: i32, error: i32) -> HeaderMap {
+    HeaderMap::from_iter(vec![
+      (
+        CONTENT_TYPE,
+        HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap(),
+      ),
+      (
+        HeaderName::from_str(TAURI_INVOKE_KEY_HEADER_NAME).unwrap(),
+        HeaderValue::from_str(invoke_key).unwrap(),
+      ),
+      (
+        HeaderName::from_str(TAURI_CALLBACK_HEADER_NAME).unwrap(),
+        HeaderValue::from_str(&callback.to_string()).unwrap(),
+      ),
+      (
+        HeaderName::from_str(TAURI_ERROR_HEADER_NAME).unwrap(),
+        HeaderValue::from_str(&error.to_string()).unwrap(),
+      ),
+    ])
+  }
+
+  fn test_manager() -> AppManager<Wry> {
+    let context = generate_context!("test/fixture/src-tauri/tauri.conf.json", crate, test = true);
+    AppManager::with_handlers(
+      context,
+      PluginStore::default(),
+      Box::new(|_| false),
+      None,
+      #[cfg(any(target_os = "macos", target_os = "ios"))]
+      None,
+      Default::default(),
+      Default::default(),
+      StateManager::new(),
+      Default::default(),
+      #[cfg(all(desktop, feature = "tray-icon"))]
+      Default::default(),
+      Default::default(),
+      Default::default(),
+      Default::default(),
+      "".into(),
+      None,
+      crate::generate_invoke_key().unwrap(),
+    )
+  }
+
+  #[test]
+  fn parse_invoke_request_origin_missing_falls_back() {
+    let manager = test_manager();
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
+    let headers = base_headers("1234ahdsjkl123", 12378123, 6243);
+
+    let mut request = Request::builder().uri("ipc://localhost/write_something");
+    *request.headers_mut().unwrap() = headers;
+    let request = request.body(Vec::new()).unwrap();
+
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
+    assert_eq!(invoke_request.url, fallback_origin);
+  }
+
+  #[test]
+  fn parse_invoke_request_origin_empty_falls_back() {
+    let manager = test_manager();
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
+    let mut headers = base_headers("1234ahdsjkl123", 12378123, 6243);
+    headers.insert(ORIGIN, HeaderValue::from_str("").unwrap());
+
+    let mut request = Request::builder().uri("ipc://localhost/write_something");
+    *request.headers_mut().unwrap() = headers;
+    let request = request.body(Vec::new()).unwrap();
+
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
+    assert_eq!(invoke_request.url, fallback_origin);
+  }
+
+  #[test]
+  fn parse_invoke_request_origin_null_falls_back() {
+    let manager = test_manager();
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
+    let mut headers = base_headers("1234ahdsjkl123", 12378123, 6243);
+    headers.insert(ORIGIN, HeaderValue::from_str("null").unwrap());
+
+    let mut request = Request::builder().uri("ipc://localhost/write_something");
+    *request.headers_mut().unwrap() = headers;
+    let request = request.body(Vec::new()).unwrap();
+
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
+    assert_eq!(invoke_request.url, fallback_origin);
+  }
+
+  #[test]
+  fn parse_invoke_request_origin_valid_matching_is_unchanged() {
+    let manager = test_manager();
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
+    let mut headers = base_headers("1234ahdsjkl123", 12378123, 6243);
+    headers.insert(ORIGIN, HeaderValue::from_str("tauri://localhost").unwrap());
+
+    let mut request = Request::builder().uri("ipc://localhost/write_something");
+    *request.headers_mut().unwrap() = headers;
+    let request = request.body(Vec::new()).unwrap();
+
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
+    assert_eq!(invoke_request.url, "tauri://localhost".parse().unwrap());
+  }
+
+  #[test]
+  fn parse_invoke_request_origin_valid_mismatched_is_not_fallback() {
+    let manager = test_manager();
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
+    let mut headers = base_headers("1234ahdsjkl123", 12378123, 6243);
+    headers.insert(ORIGIN, HeaderValue::from_str("https://evil.example").unwrap());
+
+    let mut request = Request::builder().uri("ipc://localhost/write_something");
+    *request.headers_mut().unwrap() = headers;
+    let request = request.body(Vec::new()).unwrap();
+
+    // a well-formed Origin is used verbatim and never silently replaced by the fallback,
+    // so a mismatched origin is still distinguishable from a local one by its caller
+    // (`Webview::on_message`'s `is_local_url` check).
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
+    assert_eq!(invoke_request.url, "https://evil.example".parse().unwrap());
+    assert_ne!(invoke_request.url, fallback_origin);
+  }
+
+  #[test]
+  fn parse_invoke_request_origin_garbage_still_errors() {
+    let manager = test_manager();
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
+    let mut headers = base_headers("1234ahdsjkl123", 12378123, 6243);
+    headers.insert(ORIGIN, HeaderValue::from_str("not a url").unwrap());
+
+    let mut request = Request::builder().uri("ipc://localhost/write_something");
+    *request.headers_mut().unwrap() = headers;
+    let request = request.body(Vec::new()).unwrap();
+
+    let err = super::parse_invoke_request(&manager, &fallback_origin, request).unwrap_err();
+    assert_eq!(err, "Origin header is not a valid URL");
   }
 
   #[test]
@@ -703,6 +877,7 @@ mod tests {
 
     let cmd = "write_something";
     let url = "tauri://localhost";
+    let fallback_origin: Url = "tauri://fallback".parse().unwrap();
     let invoke_key = "1234ahdsjkl123";
     let callback = 12378123;
     let error = 6243;
@@ -731,7 +906,8 @@ mod tests {
     *request.headers_mut().unwrap() = headers.clone();
     let body = serde_json::to_vec(&isolation_payload_raw).unwrap();
     let request = request.body(body).unwrap();
-    let invoke_request = super::parse_invoke_request(&manager, request).unwrap();
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
 
     assert_eq!(invoke_request.cmd, cmd);
     assert_eq!(invoke_request.callback.0, callback);
@@ -739,15 +915,45 @@ mod tests {
     assert_eq!(invoke_request.invoke_key, invoke_key);
     assert_eq!(invoke_request.url, url.parse().unwrap());
     assert_eq!(invoke_request.headers, headers);
-    assert_eq!(invoke_request.body, InvokeBody::Raw(body_raw));
+    assert_eq!(invoke_request.body, InvokeBody::Raw(body_raw.clone()));
 
     let mut request = Request::builder().uri(format!("ipc://localhost/{cmd}"));
     *request.headers_mut().unwrap() = headers.clone();
     let body = serde_json::to_vec(&isolation_payload_json).unwrap();
     let request = request.body(body).unwrap();
-    let invoke_request = super::parse_invoke_request(&manager, request).unwrap();
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
 
     assert_eq!(invoke_request.headers, headers);
     assert_eq!(invoke_request.body, InvokeBody::Json(body_json));
+
+    // the Origin-fallback behavior (missing/empty/"null") is upstream of the isolation
+    // decrypt step, so it must hold under the isolation pattern as well.
+    for bad_origin in ["", "null"] {
+      let mut headers = headers.clone();
+      headers.insert(ORIGIN, HeaderValue::from_str(bad_origin).unwrap());
+
+      let mut request = Request::builder().uri(format!("ipc://localhost/{cmd}"));
+      *request.headers_mut().unwrap() = headers;
+      let body = serde_json::to_vec(&isolation_payload_raw).unwrap();
+      let request = request.body(body).unwrap();
+      let invoke_request =
+        super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
+
+      assert_eq!(invoke_request.url, fallback_origin);
+      assert_eq!(invoke_request.body, InvokeBody::Raw(body_raw.clone()));
+    }
+
+    let mut headers_without_origin = headers.clone();
+    headers_without_origin.remove(ORIGIN);
+    let mut request = Request::builder().uri(format!("ipc://localhost/{cmd}"));
+    *request.headers_mut().unwrap() = headers_without_origin;
+    let body = serde_json::to_vec(&isolation_payload_raw).unwrap();
+    let request = request.body(body).unwrap();
+    let invoke_request =
+      super::parse_invoke_request(&manager, &fallback_origin, request).unwrap();
+
+    assert_eq!(invoke_request.url, fallback_origin);
+    assert_eq!(invoke_request.body, InvokeBody::Raw(body_raw));
   }
 }
